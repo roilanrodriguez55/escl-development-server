@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mock-escl-scanner"
+version = "0.1.0"
+description = "Local mock eSCL/AirScan scanner server for development and testing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Mock eSCL contributors" }]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "zeroconf>=0.130",
+    "Pillow>=10.0",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+]
+
+[project.scripts]
+mock-escl = "mock_escl.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
