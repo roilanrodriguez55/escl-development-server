@@ -1,143 +1,218 @@
 # Mock eSCL Scanner Server
 
-A local mock **eSCL/AirScan** scanner server written in Python. It advertises
-itself on the LAN via **mDNS/DNS-SD** so that real scanner client applications
-(macOS Image Capture, iOS Notes, Windows Scanner Service, Linux `scanimage`
-through `sane-airscan`, Paperless-ngx, mobile scanner apps, etc.) can discover
-it and submit scan jobs — without any physical hardware.
+A **fake scanner** for your local network. It speaks the same language as a real
+eSCL/AirScan scanner, so any scanner client (macOS Image Capture, iOS Notes,
+Windows, Linux `scanimage`, mobile apps, etc.) can discover it on your LAN and
+"scan" documents — **no hardware needed**.
 
-The server is fully spec-driven:
+The server generates a synthetic test image for every scan job and hands it
+back through the standard eSCL HTTP API.
+
+---
+
+## Table of contents
+
+- [What is eSCL?](#what-is-escl)
+- [Why use this?](#why-use-this)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Running the server](#running-the-server)
+- [Testing it](#testing-it)
+  - [Quick HTTP smoke test](#quick-http-smoke-test)
+  - [LAN discovery (mDNS)](#lan-discovery-mdns)
+  - [Using a real client app](#using-a-real-client-app)
+- [Configuration](#configuration)
+- [HTTP API reference](#http-api-reference)
+- [Diagnostic endpoints](#diagnostic-endpoints)
+- [How a scan works (end-to-end)](#how-a-scan-works-end-to-end)
+- [Project layout](#project-layout)
+- [Compatibility matrix](#compatibility-matrix)
+- [Troubleshooting](#troubleshooting)
+- [Limitations](#limitations)
+- [Development](#development)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+---
+
+## What is eSCL?
+
+**eSCL** (eSCL Scanner Control Language) is a REST/XML protocol defined by HP
+and standardised through Mopria. It is the protocol used by AirScan / Mopria
+printers to expose their scanner over the network. Modern operating systems
+talk to it natively:
+
+| OS | Native client |
+|----|---------------|
+| macOS | Image Capture |
+| iOS / iPadOS | Notes, Files, "Scan Documents" action |
+| Windows 10/11 | Windows Scanner Service (Settings → Bluetooth & devices → Printers & scanners) |
+| Linux | `sane-airscan` → `scanimage`, SANE frontends (XSane, gscan2pdf), Paperless-ngx |
+
+This server pretends to be one of those devices. It announces itself on the LAN
+using **mDNS / DNS-SD** (the same mechanism AirPrint / AirPlay use) so clients
+discover it automatically — no manual IP entry required.
+
+## Why use this?
+
+- **Develop scanner integrations without a physical device.** Handy for CI,
+  demos, or working from a coffee shop.
+- **Reproduce bugs.** The "scan" is deterministic: same settings → same image.
+- **Test how your app behaves with a real scanner client.** Spin this up, point
+  macOS Image Capture at it, and observe.
+- **Demo offline.** No USB scanners, no drivers, no surprises.
+
+## Features
 
 - Implements the canonical eSCL endpoints (`ScannerCapabilities`,
-  `ScannerStatus`, `ScanJobs` create/get/delete, `NextDocument`).
-- Uses the `http://schemas.hp.com/eSCL/2012/02` XML namespace that real-world
-  clients (notably `sane-airscan`) parse.
-- Advertises as `_uscan._tcp.local.` with the `_universal` subtype for maximum
-  client compatibility.
+  `ScannerStatus`, `ScanJobs` create/get/delete, `NextDocument`, `ScanImageInfo`).
+- Advertises as `_uscan._tcp.local.` plus the `_universal` subtype so the widest
+  range of clients find it.
+- Uses the official `http://schemas.hp.com/eSCL/2012/02` XML namespace.
+- Synthetic scanned images generated with Pillow — no real data, no leakage.
+- Request/response capture to disk for debugging clients.
+- Configurable: name, manufacturer, model, platen size, resolutions, color
+  modes, scan delay, optional ADF block.
+- Pure Python, single process, no database.
 
-## Why
+## Requirements
 
-Use it to:
+| Requirement | Why |
+|-------------|-----|
+| **Python 3.10+** | Runtime |
+| **pip** | Install dependencies |
+| **`avahi-daemon`** (Linux only) | The OS daemon that actually publishes mDNS. The server uses `zeroconf` but Linux still needs the daemon installed. |
+| **`avahi-utils`** (Linux, optional) | `avahi-browse` to verify discovery from another machine. |
+| **Bonjour Print Services** (Windows only) | Lets Windows see mDNS services. |
 
-- Develop or test scanner integrations without a physical device.
-- Demo eSCL client applications in environments without hardware.
-- Reproduce or debug issues that depend on a known, deterministic scanner
-  response.
+Dependencies are listed in `requirements.txt` and installed automatically:
+`fastapi`, `uvicorn`, `zeroconf`, `Pillow`, `pydantic`, `pydantic-settings`.
 
-## System requirements
-
-Install these on the machine that will run the server:
-
-- **Python 3.10 or newer.**
-- **pip** (bundled with most Python distributions).
-- **`avahi-daemon`** running on Linux so the OS lets you announce mDNS
-  services. Required even if you don't browse.
-- **`avahi-utils`** (optional, but recommended) for `avahi-browse`.
-
-On **Windows**, install **Bonjour Print Services** (Apple) so that mDNS
-reception works. The server itself still runs fine under WSL or native Python.
-
-## Install
+## Installation
 
 ```bash
+# 1. Clone or download
+git clone https://github.com/your-org/mock-escl-scanner.git
+cd mock-escl-scanner
+
+# 2. Create a virtual environment (recommended)
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate        # Linux/macOS
+# .\.venv\Scripts\Activate.ps1   # Windows PowerShell
+
+# 3. Install dependencies
 pip install -r requirements.txt
-```
 
-For an editable install (also gives you the `mock-escl` console script):
-
-```bash
+# 4. (Optional) Install as a package — gives you the `mock-escl` command
 pip install -e .
 ```
 
-## Run
+## Running the server
 
 ```bash
 python -m mock_escl --config config/scanner.json
 ```
 
-You should see output similar to:
+You should see:
 
 ```text
+[INFO] mock_escl.server: Mock eSCL scanner started on 0.0.0.0:8080
 [INFO] mock_escl.discovery: Advertising on mDNS at 192.168.1.50:8080
 [INFO] mock_escl.discovery: Registered: Python Mock eSCL Scanner._uscan._tcp.local.
 [INFO] mock_escl.discovery: Registered: Python Mock eSCL Scanner._universal._sub._uscan._tcp.local.
 [INFO] mock_escl: Capabilities: http://0.0.0.0:8080/eSCL/ScannerCapabilities
 ```
 
-CLI flags:
+Press `Ctrl+C` to stop. The mDNS registration is cleaned up automatically.
 
-| Flag | Description |
-|---|---|
-| `--config PATH` | Path to scanner JSON config (default `config/scanner.json`). |
-| `--host IP` | Override bind host (default from config). |
-| `--port N` | Override bind port (default from config). |
-| `--log-level LEVEL` | `debug`, `info`, `warning`, `error`. |
-| `--no-mdns` | Run without advertising on mDNS. The HTTP server still works. |
+### CLI flags
 
-## Manual testing
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config PATH` | `config/scanner.json` | Scanner configuration file. |
+| `--host IP` | from config | Bind host. `0.0.0.0` listens on all interfaces. |
+| `--port N` | from config | TCP port. |
+| `--log-level LEVEL` | `info` | `debug` / `info` / `warning` / `error`. |
+| `--no-mdns` | off | Run HTTP only — useful for local testing. |
 
-### Smoke test (HTTP only)
+### Environment variables
 
-In one terminal:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOCK_ESCL_CAPTURE_DIR` | `/tmp/mock-escl-captures` | Where every incoming POST body is saved for debugging. Set to an empty string to disable. |
+
+## Testing it
+
+### Quick HTTP smoke test
+
+Open two terminals. In the first, start the server:
 
 ```bash
 python -m mock_escl --config config/scanner.json
 ```
 
-In another:
+In the second, run the bundled smoke test:
 
 ```bash
 bash scripts/smoke_test.sh
 ```
 
-This will:
+It will:
 
-1. Fetch `ScannerCapabilities`.
-2. `POST` a `ScanSettings` document and capture the `Location` header.
-3. Wait for the simulated scan delay.
-4. Download `NextDocument` and save it as `scanned.png`.
+1. GET `/eSCL/ScannerCapabilities` and print the first 25 lines of XML.
+2. POST a `ScanSettings` body and capture the `Location` header it gets back.
+3. Wait a couple of seconds (the configured scan delay).
+4. GET `…/NextDocument` and save it as `scanned.png`.
 
-### Discovery (Linux)
-
-From another machine (or the same one) with `avahi-utils`:
+Override the URL if the server is on another host or port:
 
 ```bash
-bash scripts/discover_test.sh
-# or directly:
+BASE_URL=http://192.168.1.50:8080 ./scripts/smoke_test.sh
+```
+
+### LAN discovery (mDNS)
+
+Verify the server is being advertised:
+
+```bash
+# Linux (requires avahi-utils)
 avahi-browse -rt _uscan._tcp
-```
 
-### Discovery (macOS)
-
-```bash
+# macOS
 dns-sd -B _uscan._tcp
+
+# Windows: open Settings → Bluetooth & devices → Printers & scanners
+# (requires Bonjour Print Services)
 ```
 
-### Discovery (Windows)
+You should see an entry with the name from your config file
+(`Python Mock eSCL Scanner` by default).
 
-Open **Settings → Bluetooth & devices → Printers & scanners**. The mock
-scanner should appear in the list within a minute. (Requires Bonjour Print
-Services installed.)
+### Using a real client app
 
-### Discovery via SANE (Linux)
-
-If `sane-airscan` is installed, any SANE frontend — including `scanimage` —
-will automatically pick up the mock:
+If `sane-airscan` is installed on Linux:
 
 ```bash
 sudo apt install sane-airscan sane-utils
 scanimage -L
-# expected:
-# device `airscan:e0:Mock Inc.:ESCL-2000' is a ...
+# device `airscan:e0:Mock Inc.:ESCL-2000' is a Mock Inc. ESCL-2000 flatbed scanner
 
-scanimage --format=png --output-file test.png
+scanimage --format=png --resolution 300 --output-file test.png
 ```
+
+On macOS, open **Image Capture** — the scanner should appear in the device list
+within a few seconds. Click *Scan*.
+
+On iOS, open **Notes**, create a new note, long-press → **Scan Documents** —
+the mock will show up under "Scanners" in the top-right menu.
+
+On Windows, **Settings → Bluetooth & devices → Printers & scanners → Add
+device** → "Python Mock eSCL Scanner".
 
 ## Configuration
 
-`config/scanner.json`:
+Edit `config/scanner.json` to change what the server advertises:
 
 ```json
 {
@@ -161,69 +236,184 @@ scanimage --format=png --output-file test.png
 ```
 
 | Field | Meaning |
-|---|---|
-| `host` | Bind address. `0.0.0.0` listens on all interfaces. |
-| `port` | TCP port to bind. Default `8080`. |
-| `name` | Human-friendly scanner name advertised via mDNS. |
+|-------|---------|
+| `host` | Bind address. `0.0.0.0` = all interfaces. |
+| `port` | TCP port to bind (default `8080`). |
+| `name` | Friendly name advertised via mDNS. |
 | `manufacturer` / `model` | Used in `MakeAndModel` and the mDNS TXT record. |
-| `serial` / `uuid` | Stable identifiers for the device. |
+| `serial` / `uuid` | Stable device identifiers. |
 | `color_modes` | Color modes advertised in `ScannerCapabilities`. |
-| `resolutions` | Discrete DPI values advertised. |
-| `max_width_mm` / `max_height_mm` | Platen size in millimetres. |
-| `default_format` | Format used when the client doesn't specify one. |
-| `delay_seconds` | Simulated scan time before the image is available. |
-| `service_type` | mDNS service type (leave as `_uscan._tcp.local.`). |
-| `adf_enabled` | Advertise an automatic document feeder block. |
-| `duplex_supported` | Reserved for future duplex support. |
+| `resolutions` | Discrete DPI values. |
+| `max_width_mm` / `max_height_mm` | Platen size (A4 = 210×297 by default). |
+| `default_format` | Fallback format when the client doesn't request one. |
+| `delay_seconds` | Simulated scan time before the image is ready. |
+| `service_type` | mDNS service type. Leave as `_uscan._tcp.local.`. |
+| `adf_enabled` | When `true`, advertise an automatic document feeder block. |
+| `duplex_supported` | Reserved. |
 
-## Endpoints exposed
+## HTTP API reference
 
 | Method | Path | Purpose |
-|---|---|---|
-| GET | `/eSCL/ScannerCapabilities` | Device capabilities XML. |
-| GET | `/eSCL/ScannerStatus` | Current scanner and job status. |
-| GET | `/eSCL/ScannerIcon` | Tiny placeholder icon. |
-| POST | `/eSCL/ScanJobs` | Submit a `ScanSettings` body; returns `201` + `Location`. |
-| GET | `/eSCL/ScanJobs/{id}` | Per-job status XML. |
-| GET | `/eSCL/ScanJobs/{id}/NextDocument` | The scanned document bytes. |
-| DELETE | `/eSCL/ScanJobs/{id}` | Cancel a queued job. |
+|--------|------|---------|
+| `GET` | `/eSCL/ScannerCapabilities` | Device capabilities XML. |
+| `GET` | `/eSCL/ScannerStatus` | Current scanner + job state. |
+| `GET` | `/eSCL/ScannerIcon` | Tiny 1×1 PNG icon. |
+| `POST` | `/eSCL/ScanJobs` | Submit a `ScanSettings` body. Returns `201` + `Location`. |
+| `GET` | `/eSCL/ScanJobs/{id}` | Per-job status XML. |
+| `GET` | `/eSCL/ScanJobs/{id}/ScanImageInfo` | Description of the upcoming document (some clients require it). |
+| `GET` | `/eSCL/ScanJobs/{id}/NextDocument` | The scanned image bytes (PNG / JPEG / TIFF; PDF returned as PNG). |
+| `DELETE` | `/eSCL/ScanJobs/{id}` | Cancel a job. |
 
-## Compatibility notes
+If the client sends `Accept: multipart/related`, `NextDocument` returns a
+multipart response with `ScanImageInfo` XML first, then the image bytes —
+matching what strict eSCL clients expect.
 
-- **Linux**: requires `avahi-daemon` running. The server speaks zeroconf
-  directly, but daemon installation is still required on most distros.
-- **Windows**: install Bonjour Print Services for mDNS reception.
-- **macOS**: works out of the box.
-- **PDF**: requests for `application/pdf` are accepted, but the synthetic
-  image is encoded as PNG (Pillow cannot write PDF without an extra
-  dependency). Adjust `_extension_for` in `src/mock_escl/jobs.py` and add a
-  PDF library if you need real PDF output.
-- **Real clients**: any AirScan/Mopria-compatible client will work. If you
-  find one that doesn't, capture its `ScanSettings` payload to add support
-  for fields we currently parse by substring match.
+## Diagnostic endpoints
 
-## Firewall
+These are not part of the eSCL spec — they are mock-only helpers for debugging
+client behaviour:
 
-If the server's port is blocked, clients on the LAN won't be able to
-connect. Open it:
+| Method | Path | Returns |
+|--------|------|---------|
+| `GET` | `/admin/last-requests` | Last 20 requests as JSON (method, path, headers, body preview). |
+| `GET` | `/admin/captures` | The list of files captured to disk. |
 
-```bash
-# ufw
-sudo ufw allow 8080/tcp
+The server also writes every POST body and a `.meta` sidecar file to
+`MOCK_ESCL_CAPTURE_DIR`. Inspect those when a client misbehaves.
 
-# firewalld
-sudo firewall-cmd --add-port=8080/tcp --permanent
-sudo firewall-cmd --reload
+## How a scan works (end-to-end)
+
+```
+1. Client      discovers the scanner via mDNS (_uscan._tcp).
+2. Client      GET /eSCL/ScannerCapabilities   →  decides what the device supports.
+3. Client      POST /eSCL/ScanJobs  (XML body) →  server creates a job, returns 201
+                                                 with Location: /eSCL/ScanJobs/{id}.
+4. Server      "scans" (waits delay_seconds, generates an image with Pillow).
+5. Client      polls GET /eSCL/ScanJobs/{id}   →  sees JobState transition to Completed.
+6. Client      GET /eSCL/ScanJobs/{id}/NextDocument  →  receives the image bytes.
+7. Client      DELETE /eSCL/ScanJobs/{id}     →  cleans up.
 ```
 
-## Future work
+The server records each step. If anything goes wrong, check
+`/admin/last-requests` and the capture directory.
 
-- **TWAIN Direct** support. Conceptually similar to eSCL — would expose a
-  second REST API alongside the existing one. Would broaden real-client
-  coverage (notably Windows-native TWAIN Direct apps).
-- **Multi-page documents** and feeder simulation.
-- **TLS** via `_uscans._tcp.local.` for clients that require it.
-- **pytest** suite (deferred per project decision).
+## Project layout
+
+```
+.
+├── README.md                 ← you are here
+├── pyproject.toml            ← package metadata + console script
+├── requirements.txt
+├── .gitignore
+│
+├── config/
+│   └── scanner.json          ← default scanner configuration
+│
+├── scripts/
+│   ├── smoke_test.sh         ← end-to-end HTTP test
+│   └── discover_test.sh      ← mDNS verification
+│
+└── src/
+    └── mock_escl/
+        ├── __init__.py
+        ├── __main__.py       ← CLI entry point
+        ├── config.py         ← ScannerConfig pydantic model
+        ├── discovery.py      ← mDNS / Zeroconf advertiser
+        ├── jobs.py           ← JobManager, ScanJob, synthetic image generation
+        ├── models.py         ← Pydantic models
+        ├── server.py         ← FastAPI app + eSCL endpoints
+        └── images.py         ← Pillow-based synthetic image builder
+```
+
+## Compatibility matrix
+
+| Client | Platform | Status |
+|--------|----------|--------|
+| `sane-airscan` / `scanimage` | Linux | ✅ tested |
+| macOS Image Capture | macOS 11+ | ✅ |
+| iOS / iPadOS "Scan Documents" | iOS 13+ | ✅ |
+| Windows Scanner Service | Win 10/11 | ✅ (requires Bonjour Print Services) |
+| Paperless-ngx | cross-platform | ✅ |
+| Generic AirScan apps | mobile | ✅ |
+
+The TXT record advertises `protocol=uscan`, `rs=eSCL`, standard color/format
+fields, and a `_universal._sub._uscan._tcp.local.` subtype — the same shape
+real eSCL hardware emits.
+
+## Troubleshooting
+
+**Server starts but clients can't find it on Linux.**
+Make sure `avahi-daemon` is running: `systemctl status avahi-daemon`. On
+NetworkManager-managed interfaces you may also need
+`systemctl enable avahi-daemon`. Firewalls must allow UDP port 5353 (mDNS) and
+the server's TCP port.
+
+**Windows doesn't show the scanner.**
+Install **Bonjour Print Services** from Apple's website and reboot. Without it,
+Windows can't see mDNS services at all.
+
+**Client connects but the scan fails immediately.**
+Run `bash scripts/smoke_test.sh` first — if that works, the issue is in what
+the client sends. Hit `http://<server>:8080/admin/last-requests` to see the
+request your client actually made and check the body in
+`MOCK_ESCL_CAPTURE_DIR`.
+
+**`avahi-browse` returns nothing from another machine.**
+Make sure the server is binding on `0.0.0.0` (not `127.0.0.1`) and that no
+firewall blocks UDP 5353 between machines. Some routers block multicast between
+Wi-Fi clients — try Ethernet.
+
+**`scanimage -L` lists the device but `scanimage` errors out.**
+The mock returns PNG bytes even when the client asks for PDF (Pillow can't
+write PDF without extra deps). See the *Limitations* section.
+
+**Port 8080 already in use.**
+Either stop the conflicting service, or change `port` in `config/scanner.json`,
+or pass `--port 9090`.
+
+## Limitations
+
+- **PDF output is fake.** Requests for `application/pdf` succeed, but the bytes
+  are encoded as PNG (Pillow can't write PDF without `reportlab` / `fpdf2`).
+  Add a real PDF library and update `_extension_for` in `src/mock_escl/jobs.py`
+  if you need genuine PDF.
+- **Single-page scans only.** No feeder simulation; every job has one page.
+- **No duplex support.** `duplex_supported` is reserved.
+- **No TLS.** Clients requiring `_uscans._tcp.local.` (note the `s`) will
+  refuse to connect.
+- **No TWAIN Direct.** See the roadmap.
+
+## Development
+
+```bash
+# Run with debug logging
+python -m mock_escl --config config/scanner.json --log-level debug
+
+# Inspect request traffic while developing a client
+watch -n1 'curl -s http://127.0.0.1:8080/admin/last-requests | tail -40'
+
+# Rebuild after editing
+pip install -e .
+```
+
+Project conventions:
+
+- Code lives under `src/mock_escl/` (src-layout).
+- Dependencies pinned with `>=` (loose). A real lockfile is intentionally
+  avoided — the project is small enough that drift isn't worth the friction.
+- The `--no-mdns` flag exists so you can run unit-style checks without
+  polluting the LAN.
+- No test suite yet (see roadmap).
+
+## Roadmap
+
+- **TWAIN Direct** support — a second REST API alongside eSCL, widening
+  Windows-native client coverage.
+- **Multi-page / feeder simulation** — generate N synthetic pages per job.
+- **TLS via `_uscans._tcp.local.`** — for clients that require encrypted
+  transport.
+- **pytest suite** — deferred by project decision; smoke + discover scripts
+  cover the critical paths today.
 
 ## License
 
