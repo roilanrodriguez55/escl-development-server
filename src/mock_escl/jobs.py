@@ -250,28 +250,45 @@ class JobManager:
 
         For PDF, the result is a single multi-page PDF; for raster
         formats, each entry is a separate image with the page number
-        stamped on it.
+        stamped on it. When ``job.duplex`` is true, each sheet
+        contributes two pages (front + back) and the back side gets
+        different content drawn from a side-specific pool.
         """
+        sides_per_sheet = 2 if job.duplex else 1
+        total_pages = count * sides_per_sheet
+
         LOGGER.debug(
-            "[job %s] _render_pages format=%s color=%s res=%d intent=%s pages=%d",
+            "[job %s] _render_pages format=%s color=%s res=%d intent=%s "
+            "sheets=%d sides_per_sheet=%d total_pages=%d",
             job.job_id,
             job.document_format,
             job.color_mode,
             job.resolution,
             job.intent or "(none)",
             count,
+            sides_per_sheet,
+            total_pages,
         )
         if job.document_format == "application/pdf":
-            return [self._render_text_pdf(job, count)]
+            return [self._render_text_pdf(job, total_pages, duplex=job.duplex)]
         return [
-            self._render_color_image(job, page_index=i, page_total=count)
-            for i in range(1, count + 1)
+            self._render_color_image(
+                job,
+                page_index=i,
+                page_total=total_pages,
+                side="back" if job.duplex and i % 2 == 0 else "front",
+            )
+            for i in range(1, total_pages + 1)
         ]
 
     # ----- color image path ------------------------------------------ #
 
     def _render_color_image(
-        self, job: ScanJob, page_index: int = 1, page_total: int = 1
+        self,
+        job: ScanJob,
+        page_index: int = 1,
+        page_total: int = 1,
+        side: str = "front",
     ) -> bytes:
         width_px, height_px = self._compute_pixel_size(job)
 
@@ -293,7 +310,9 @@ class JobManager:
             )
 
         cursor_y = margin
-        lines = self._image_text_lines(job, page_index=page_index, page_total=page_total)
+        lines = self._image_text_lines(
+            job, page_index=page_index, page_total=page_total, side=side
+        )
         for i, text in enumerate(lines):
             line_y = cursor_y + i * (font_size + int(font_size / 2))
             if line_y > height_px - margin:
@@ -321,7 +340,11 @@ class JobManager:
         return "RGB", "white", "black"
 
     def _image_text_lines(
-        self, job: ScanJob, page_index: int = 1, page_total: int = 1
+        self,
+        job: ScanJob,
+        page_index: int = 1,
+        page_total: int = 1,
+        side: str = "front",
     ) -> list[str]:
         """Build the header + body text that gets stamped on the image."""
         timestamp = self._deterministic_timestamp(job)
@@ -332,8 +355,9 @@ class JobManager:
             f"Color:     {job.color_mode}",
             f"Resolution: {job.resolution} DPI",
         ]
-        if page_total > 1:
-            header.append(f"Page:      {page_index} of {page_total}")
+        if page_total > 1 or side == "back":
+            label = f"Page:      {page_index} of {page_total} ({side})"
+            header.append(label)
         header.append("")
         body_prefix = "Simulated scanned line"
         body_count = 12
@@ -341,7 +365,7 @@ class JobManager:
             rng = random.Random(
                 (self._seed ^ hash(job.job_id)) ^ (page_index * 9973)
             )
-            sample_pool = [
+            front_pool = [
                 "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
                 "The quick brown fox jumps over the lazy dog.",
                 "Driverless scanning via eSCL/AirScan and WSD.",
@@ -349,10 +373,20 @@ class JobManager:
                 "Pellentesque habitant morbi tristique senectus et netus.",
                 "Vestibulum ante ipsum primis in faucibus orci luctus.",
             ]
-            body = [f"{body_prefix} {i}: {rng.choice(sample_pool)}" for i in range(1, body_count + 1)]
+            back_pool = [
+                "Continued from the front side of this page.",
+                "Reverse-side content drawn from a separate pool.",
+                "Duplex scanning alternates front and back sheets.",
+                "The back side usually has different content.",
+                "Two pages per physical sheet on duplex-enabled devices.",
+                "AirScan and Mopria clients support duplex via <scan:Duplex>.",
+            ]
+            pool = back_pool if side == "back" else front_pool
+            body = [f"{body_prefix} {i}: {rng.choice(pool)}" for i in range(1, body_count + 1)]
         else:
+            suffix = "back side" if side == "back" else "front side"
             body = [
-                f"{body_prefix} {i}: "
+                f"{body_prefix} {i} ({suffix}): "
                 "this content was generated locally by the mock eSCL server."
                 for i in range(1, body_count + 1)
             ]
@@ -367,7 +401,7 @@ class JobManager:
 
     # ----- PDF text document path ------------------------------------ #
 
-    def _render_text_pdf(self, job: ScanJob, page_total: int = 1) -> bytes:
+    def _render_text_pdf(self, job: ScanJob, page_total: int = 1, duplex: bool = False) -> bytes:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas as rl_canvas
 
@@ -397,6 +431,8 @@ class JobManager:
         page_h_pt = page_h
 
         for page_index in range(1, max(1, page_total) + 1):
+            side = "back" if duplex and page_index % 2 == 0 else "front"
+
             c.setFont(font_bold, 11)
             c.drawString(
                 margin_pt,
@@ -410,6 +446,12 @@ class JobManager:
                 f"Scan {job.job_id[:8]} • {job.resolution} DPI • "
                 f"{job.color_mode} • {job.document_format}",
             )
+            if page_total > 1 or duplex:
+                c.drawString(
+                    margin_pt,
+                    page_h_pt - margin_pt - 22,
+                    f"Page {page_index} of {page_total} ({side})",
+                )
             c.line(
                 margin_pt,
                 page_h_pt - margin_pt - 16,

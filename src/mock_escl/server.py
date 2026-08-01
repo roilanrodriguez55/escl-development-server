@@ -1197,10 +1197,15 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
             "application/pdf": "pdf",
         }.get(job.document_format, "bin")
 
+        side_suffix = ""
+        if job.duplex and job.pages_total > 1:
+            side = "back" if page_index % 2 == 1 else "front"
+            side_suffix = f"-{side}"
+
         if job.pages_total > 1:
-            filename = f"scan-{job.job_id}-page-{page_index + 1:02d}.{ext}"
+            filename = f"scan-{job.job_id}-page-{page_index + 1:02d}{side_suffix}.{ext}"
         else:
-            filename = f"scan-{job.job_id}.{ext}"
+            filename = f"scan-{job.job_id}{side_suffix}.{ext}"
 
         if "multipart/related" in accept:
             boundary = "MOCK_ESCL_BOUNDARY"
