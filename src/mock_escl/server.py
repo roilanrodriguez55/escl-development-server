@@ -742,6 +742,8 @@ def _fallback_substring_parse(body: bytes, config: ScannerConfig) -> dict:
         document_format = "image/png"
     elif b"application/pdf" in body or b"<scan:ImageFormat>PDF" in body:
         document_format = "application/pdf"
+    elif b"application/octet-stream" in body or b"<scan:ImageFormat>OCTET" in body:
+        document_format = "application/octet-stream"
 
     if b"Grayscale8" in body:
         color_mode = "Grayscale8"
