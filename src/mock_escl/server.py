@@ -725,6 +725,15 @@ def _absolute_base_url(request: Request, config: ScannerConfig) -> str:
     return _server_url(config)
 
 
+async def _render_inline(jobs: JobManager, job: ScanJob) -> None:
+    """Render a job inside the request handler (no async scheduling).
+
+    Used when ``delay_seconds <= 0``. Awaits one tick of the event loop
+    so the cancellation/shutdown machinery still works.
+    """
+    await jobs.render_inline(job)
+
+
 # --------------------------------------------------------------------------- #
 #  FastAPI application factory
 # --------------------------------------------------------------------------- #
@@ -913,7 +922,13 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         )
 
         job = jobs.create(**parsed)
-        asyncio.create_task(jobs.process(job))
+
+        # Inline render when delay=0 avoids the race where a fast client
+        # calls NextDocument before the asyncio task gets a chance to run.
+        if config.delay_seconds <= 0:
+            await _render_inline(jobs, job)
+        else:
+            jobs.schedule_process(job)
 
         base = _absolute_base_url(request, config)
         location = f"{base}/eSCL/ScanJobs/{job.job_id}"

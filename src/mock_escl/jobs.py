@@ -32,6 +32,7 @@ class JobManager:
         self.config = config
         self._jobs: dict[str, ScanJob] = {}
         self._abort_events: dict[str, asyncio.Event] = {}
+        self._tasks: set[asyncio.Task] = set()
         self._cleanup_task: asyncio.Task | None = None
         self._seed = seed
 
@@ -47,6 +48,21 @@ class JobManager:
                 await self._cleanup_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+
+    def schedule_process(self, job: ScanJob) -> asyncio.Task:
+        """Schedule ``process(job)`` and keep a strong reference.
+
+        Without the strong reference, the task could be garbage-collected
+        mid-execution because the event loop only holds a weak ref to it.
+        """
+        task = asyncio.create_task(self.process(job))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     # ------------------------------------------------------------------ #
     #  CRUD
@@ -109,13 +125,20 @@ class JobManager:
 
     async def process(self, job: ScanJob) -> None:
         """Simulate the scanner working on a job."""
-        if self._cleanup_task is None or self._cleanup_task.done():
-            try:
-                self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-            except RuntimeError:
-                # No event loop yet (tests that bypass lifespan).
-                self._cleanup_task = None
+        await self._ensure_cleanup_task()
+        await self._do_process(job)
 
+    async def render_inline(self, job: ScanJob) -> None:
+        """Render the job immediately inside the calling request.
+
+        Used when ``delay_seconds <= 0`` to avoid the race where a fast
+        client calls NextDocument before the asyncio task gets scheduled.
+        """
+        await self._ensure_cleanup_task()
+        await self._do_process(job)
+
+    async def _do_process(self, job: ScanJob) -> None:
+        """Shared async body for the scheduled and inline paths."""
         LOGGER.info(
             "[job %s] entering Processing (waiting %.1fs, format=%s color=%s res=%d)",
             job.job_id,
@@ -166,6 +189,16 @@ class JobManager:
             job.state = JobState.FAILED
             job.error_message = str(exc)
             LOGGER.exception("[job %s] render failed: %s", job.job_id, exc)
+
+    async def _ensure_cleanup_task(self) -> None:
+        if self._cleanup_task is None or self._cleanup_task.done():
+            try:
+                self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+                self._tasks.add(self._cleanup_task)
+                self._cleanup_task.add_done_callback(self._tasks.discard)
+            except RuntimeError:
+                # No event loop yet (tests that bypass lifespan).
+                self._cleanup_task = None
 
     async def _interruptible_sleep(self, seconds: float, event: asyncio.Event | None) -> None:
         """Sleep with abort polling, split into 100ms slices."""
@@ -227,22 +260,25 @@ class JobManager:
         image = Image.new(mode, (width_px, height_px), bg)
         draw = ImageDraw.Draw(image)
 
-        font_size = max(12, int(job.resolution / 4))
+        font_size = max(8, int(job.resolution / 4))
         font = self._load_font(font_size)
         fill = fg
 
-        margin = max(20, int(job.resolution / 2))
-        draw.rectangle(
-            (margin, margin, width_px - margin, height_px - margin),
-            outline=fill,
-            width=4,
-        )
+        # Cap margin so it never exceeds the image dimensions.
+        margin = max(4, int(job.resolution / 2))
+        margin = min(margin, max(2, min(width_px, height_px) // 6))
+        if margin * 2 < min(width_px, height_px):
+            draw.rectangle(
+                (margin, margin, width_px - margin, height_px - margin),
+                outline=fill,
+                width=4,
+            )
 
-        cursor_y = margin * 2
+        cursor_y = margin
         lines = self._image_text_lines(job)
         for i, text in enumerate(lines):
             line_y = cursor_y + i * (font_size + int(font_size / 2))
-            if line_y > height_px - margin * 2:
+            if line_y > height_px - margin:
                 break
             draw.text((margin * 2, line_y), text, fill=fill, font=font)
 
