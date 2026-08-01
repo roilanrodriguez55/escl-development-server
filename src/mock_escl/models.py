@@ -119,10 +119,24 @@ class ScanJob(BaseModel):
     scan_region: ScanRegion | None = None
     compression_factor: int = 25
 
-    image: bytes = b""
+    pages: list[bytes] = []
+    """Rendered document bytes, one entry per page. Empty until the
+    render finishes. For a single-page job, ``pages[0]`` is the only
+    document. The ``image`` property below is the convenience accessor
+    for the common single-page case."""
     error_message: str | None = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def image(self) -> bytes:
+        """Convenience accessor returning the first rendered page.
+
+        Most of the codebase was written assuming a single ``bytes``
+        attribute. Now that we support multi-page, callers that only
+        care about the first page can keep using ``job.image``.
+        """
+        return self.pages[0] if self.pages else b""
 
 
 __all__ = [

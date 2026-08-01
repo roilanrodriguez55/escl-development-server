@@ -36,6 +36,10 @@ class ScannerConfig(BaseModel):
     default_format: str = "image/png"
     delay_seconds: float = 0.0
 
+    pages_total: int = 1
+    """Number of pages per ADF job. 1 = single-page platen scan.
+    Set higher to simulate a feeder delivering multiple pages."""
+
     service_type: str = "_uscan._tcp.local."
 
     adf_enabled: bool = False

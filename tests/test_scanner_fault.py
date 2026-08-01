@@ -123,12 +123,10 @@ def test_failed_job_returns_scanner_fault_500(client, monkeypatch) -> None:
     """When the renderer raises, NextDocument must return 500 + ScannerFault XML."""
     from mock_escl import jobs as jobs_mod
 
-    original = jobs_mod.JobManager._render_scan
-
-    def boom(self, job):
+    def boom(self, job, count):
         raise RuntimeError("simulated render failure")
 
-    monkeypatch.setattr(jobs_mod.JobManager, "_render_scan", boom)
+    monkeypatch.setattr(jobs_mod.JobManager, "_render_pages", boom)
 
     r = client.post(
         "/eSCL/ScanJobs",

@@ -1186,7 +1186,9 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
                 detail="All pages of this job have already been delivered.",
             )
 
+        page_index = job.pages_delivered
         job.pages_delivered += 1
+        page_bytes = job.pages[page_index]
 
         ext = {
             "image/jpeg": "jpg",
@@ -1195,7 +1197,10 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
             "application/pdf": "pdf",
         }.get(job.document_format, "bin")
 
-        filename = f"scan-{job.job_id}.{ext}"
+        if job.pages_total > 1:
+            filename = f"scan-{job.job_id}-page-{page_index + 1:02d}.{ext}"
+        else:
+            filename = f"scan-{job.job_id}.{ext}"
 
         if "multipart/related" in accept:
             boundary = "MOCK_ESCL_BOUNDARY"
@@ -1206,12 +1211,14 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
                 f"--{boundary}\r\n"
                 f"Content-Type: {job.document_format}\r\n"
                 f"Content-Disposition: attachment; filename=\"{filename}\"\r\n\r\n"
-            ).encode("utf-8") + job.image + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            ).encode("utf-8") + page_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
             LOGGER.info(
-                "[%s] job %s: delivering %d bytes as multipart/related (%s)",
+                "[%s] job %s: delivering page %d/%d (%d bytes) as multipart/related (%s)",
                 request_id(),
                 job_id,
-                len(related),
+                page_index + 1,
+                job.pages_total,
+                len(page_bytes),
                 job.document_format,
             )
             return Response(
@@ -1221,14 +1228,16 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
             )
 
         LOGGER.info(
-            "[%s] job %s: delivering %d bytes (%s)",
+            "[%s] job %s: delivering page %d/%d (%d bytes, %s)",
             request_id(),
             job_id,
-            len(job.image),
+            page_index + 1,
+            job.pages_total,
+            len(page_bytes),
             job.document_format,
         )
         return Response(
-            content=job.image,
+            content=page_bytes,
             media_type=job.document_format,
             headers={
                 "Server": server_header,

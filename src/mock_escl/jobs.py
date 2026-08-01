@@ -161,27 +161,31 @@ class JobManager:
             job.state = JobState.ABORTED
             return
 
-        LOGGER.info("[job %s] rendering…", job.job_id)
+        LOGGER.info(
+            "[job %s] rendering %d page(s)…",
+            job.job_id,
+            max(1, self.config.pages_total),
+        )
         render_start = datetime.now(timezone.utc)
         try:
-            job.image = self._render_scan(job)
-            job.pages_total = 1
+            job.pages = self._render_pages(job, max(1, self.config.pages_total))
+            job.pages_total = len(job.pages)
             job.completed_at = datetime.now(timezone.utc)
             render_ms = (job.completed_at - render_start).total_seconds() * 1000
             if event is not None and event.is_set():
                 LOGGER.info(
-                    "[job %s] aborted during render (%d bytes, %.1f ms)",
+                    "[job %s] aborted during render (%d pages, %.1f ms)",
                     job.job_id,
-                    len(job.image),
+                    len(job.pages),
                     render_ms,
                 )
                 job.state = JobState.ABORTED
             else:
                 job.state = JobState.COMPLETED
                 LOGGER.info(
-                    "[job %s] completed (%d bytes %s in %.1f ms)",
+                    "[job %s] completed (%d page(s) %s in %.1f ms)",
                     job.job_id,
-                    len(job.image),
+                    len(job.pages),
                     job.document_format,
                     render_ms,
                 )
@@ -238,24 +242,39 @@ class JobManager:
     # ------------------------------------------------------------------ #
 
     def _render_scan(self, job: ScanJob) -> bytes:
+        """Render a single-page document (convenience over ``_render_pages``)."""
+        return self._render_pages(job, 1)[0]
+
+    def _render_pages(self, job: ScanJob, count: int) -> list[bytes]:
+        """Render ``count`` pages, one per ADF page.
+
+        For PDF, the result is a single multi-page PDF; for raster
+        formats, each entry is a separate image with the page number
+        stamped on it.
+        """
         LOGGER.debug(
-            "[job %s] _render_scan format=%s color=%s res=%d intent=%s",
+            "[job %s] _render_pages format=%s color=%s res=%d intent=%s pages=%d",
             job.job_id,
             job.document_format,
             job.color_mode,
             job.resolution,
             job.intent or "(none)",
+            count,
         )
         if job.document_format == "application/pdf":
-            return self._render_text_pdf(job)
-        return self._render_color_image(job)
+            return [self._render_text_pdf(job, count)]
+        return [
+            self._render_color_image(job, page_index=i, page_total=count)
+            for i in range(1, count + 1)
+        ]
 
     # ----- color image path ------------------------------------------ #
 
-    def _render_color_image(self, job: ScanJob) -> bytes:
+    def _render_color_image(
+        self, job: ScanJob, page_index: int = 1, page_total: int = 1
+    ) -> bytes:
         width_px, height_px = self._compute_pixel_size(job)
 
-        # Honour the client's color mode for raster outputs.
         mode, bg, fg = self._pil_mode_for(job.color_mode)
         image = Image.new(mode, (width_px, height_px), bg)
         draw = ImageDraw.Draw(image)
@@ -264,7 +283,6 @@ class JobManager:
         font = self._load_font(font_size)
         fill = fg
 
-        # Cap margin so it never exceeds the image dimensions.
         margin = max(4, int(job.resolution / 2))
         margin = min(margin, max(2, min(width_px, height_px) // 6))
         if margin * 2 < min(width_px, height_px):
@@ -275,15 +293,13 @@ class JobManager:
             )
 
         cursor_y = margin
-        lines = self._image_text_lines(job)
+        lines = self._image_text_lines(job, page_index=page_index, page_total=page_total)
         for i, text in enumerate(lines):
             line_y = cursor_y + i * (font_size + int(font_size / 2))
             if line_y > height_px - margin:
                 break
             draw.text((margin * 2, line_y), text, fill=fill, font=font)
 
-        # For 1-bit dithering we generate in L mode and convert with Floyd-Steinberg
-        # so the text edges look like a real B&W scan.
         if mode == "L" and job.color_mode == "BlackAndWhite1":
             image = image.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
 
@@ -304,7 +320,9 @@ class JobManager:
             return "L", 255, 0
         return "RGB", "white", "black"
 
-    def _image_text_lines(self, job: ScanJob) -> list[str]:
+    def _image_text_lines(
+        self, job: ScanJob, page_index: int = 1, page_total: int = 1
+    ) -> list[str]:
         """Build the header + body text that gets stamped on the image."""
         timestamp = self._deterministic_timestamp(job)
         header = [
@@ -313,12 +331,16 @@ class JobManager:
             f"Format:    {job.document_format}",
             f"Color:     {job.color_mode}",
             f"Resolution: {job.resolution} DPI",
-            "",
         ]
+        if page_total > 1:
+            header.append(f"Page:      {page_index} of {page_total}")
+        header.append("")
         body_prefix = "Simulated scanned line"
         body_count = 12
         if self._seed is not None:
-            rng = random.Random(self._seed ^ hash(job.job_id))
+            rng = random.Random(
+                (self._seed ^ hash(job.job_id)) ^ (page_index * 9973)
+            )
             sample_pool = [
                 "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
                 "The quick brown fox jumps over the lazy dog.",
@@ -345,7 +367,7 @@ class JobManager:
 
     # ----- PDF text document path ------------------------------------ #
 
-    def _render_text_pdf(self, job: ScanJob) -> bytes:
+    def _render_text_pdf(self, job: ScanJob, page_total: int = 1) -> bytes:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas as rl_canvas
 
@@ -353,9 +375,6 @@ class JobManager:
         page_w, page_h = A4
         c = rl_canvas.Canvas(buf, pagesize=A4)
 
-        # Pick a font family that fits the intent — like a real scanner
-        # defaulting to a serif look for ``Document`` scans and sans-serif
-        # for everything else.
         if job.intent == "Document":
             font_regular = "Times-Roman"
             font_bold = "Times-Bold"
@@ -371,78 +390,77 @@ class JobManager:
         )
         c.setCreator(_server_header(self.config))
 
-        margin = 20  # mm
-        x_left = margin
-        x_right = page_w / 72 * 25.4 - margin  # pt → mm is overkill; use mm helper
-
-        # Convert mm to points: 1 mm = 2.83464567 pt
+        margin = 20
         mm_to_pt = 72.0 / 25.4
         margin_pt = margin * mm_to_pt
-        page_w_pt = page_w  # reportlab already uses pt
+        page_w_pt = page_w
         page_h_pt = page_h
 
-        # Header
-        c.setFont(font_bold, 11)
-        c.drawString(margin_pt, page_h_pt - margin_pt, f"Mock eSCL Scanner — {self.config.name}")
-        c.setFont(font_regular, 8)
-        c.drawString(
-            margin_pt,
-            page_h_pt - margin_pt - 12,
-            f"Scan {job.job_id[:8]} • {job.resolution} DPI • "
-            f"{job.color_mode} • {job.document_format}",
-        )
-        c.line(
-            margin_pt,
-            page_h_pt - margin_pt - 16,
-            page_w_pt - margin_pt,
-            page_h_pt - margin_pt - 16,
-        )
+        for page_index in range(1, max(1, page_total) + 1):
+            c.setFont(font_bold, 11)
+            c.drawString(
+                margin_pt,
+                page_h_pt - margin_pt,
+                f"Mock eSCL Scanner — {self.config.name}",
+            )
+            c.setFont(font_regular, 8)
+            c.drawString(
+                margin_pt,
+                page_h_pt - margin_pt - 12,
+                f"Scan {job.job_id[:8]} • {job.resolution} DPI • "
+                f"{job.color_mode} • {job.document_format}",
+            )
+            c.line(
+                margin_pt,
+                page_h_pt - margin_pt - 16,
+                page_w_pt - margin_pt,
+                page_h_pt - margin_pt - 16,
+            )
 
-        # Body
-        c.setFont(font_regular, 10)
-        y = page_h_pt - margin_pt - 28
-        leading = 13
-        body_lines = self._pdf_text_lines(job)
-        max_lines_per_page = max(
-            1,
-            int((page_h_pt - 2 * margin_pt - 50) // leading),
-        )
-        line_no = 0
-        for chunk in body_lines:
-            if y < margin_pt + 30:
-                # New page (rare for a single scan; kept for completeness).
-                c.showPage()
-                c.setFont(font_regular, 10)
-                y = page_h_pt - margin_pt
-                line_no = 0
-            c.drawString(margin_pt, y, chunk)
-            y -= leading
-            line_no += 1
-            if line_no >= max_lines_per_page * 4:
-                break  # safety; should never trigger with our body size
+            c.setFont(font_regular, 10)
+            y = page_h_pt - margin_pt - 28
+            leading = 13
+            body_lines = self._pdf_text_lines(job, page_index=page_index)
+            max_lines_per_page = max(
+                1,
+                int((page_h_pt - 2 * margin_pt - 50) // leading),
+            )
+            line_no = 0
+            for chunk in body_lines:
+                if y < margin_pt + 30:
+                    c.showPage()
+                    c.setFont(font_regular, 10)
+                    y = page_h_pt - margin_pt
+                    line_no = 0
+                c.drawString(margin_pt, y, chunk)
+                y -= leading
+                line_no += 1
+                if line_no >= max_lines_per_page * 4:
+                    break
 
-        # Footer
-        c.setFont(font_regular, 7)
-        timestamp = self._deterministic_timestamp(job)
-        c.drawString(
-            margin_pt,
-            margin_pt,
-            f"Generated: {timestamp.isoformat(timespec='seconds')}",
-        )
-        c.drawRightString(
-            page_w_pt - margin_pt,
-            margin_pt,
-            "Page 1 of 1",
-        )
+            c.setFont(font_regular, 7)
+            timestamp = self._deterministic_timestamp(job)
+            c.drawString(
+                margin_pt,
+                margin_pt,
+                f"Generated: {timestamp.isoformat(timespec='seconds')}",
+            )
+            c.drawRightString(
+                page_w_pt - margin_pt,
+                margin_pt,
+                f"Page {page_index} of {page_total}",
+            )
+            c.showPage()
 
-        c.showPage()
         c.save()
         return buf.getvalue()
 
-    def _pdf_text_lines(self, job: ScanJob) -> list[str]:
+    def _pdf_text_lines(self, job: ScanJob, page_index: int = 1) -> list[str]:
         """Generate text content for the PDF page (B&W document simulation)."""
         if self._seed is not None:
-            rng = random.Random((self._seed * 31) ^ hash(job.job_id))
+            rng = random.Random(
+                ((self._seed * 31) ^ hash(job.job_id)) ^ (page_index * 7919)
+            )
         else:
             rng = random.Random()
         paragraphs = [
