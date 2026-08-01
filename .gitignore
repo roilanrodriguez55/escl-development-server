@@ -25,3 +25,5 @@ sample-scan.png
 
 # Logs
 *.log
+.codegraph
+.cursor/rules

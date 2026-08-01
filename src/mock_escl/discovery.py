@@ -34,28 +34,52 @@ def build_txt_record(config: ScannerConfig, address: str) -> dict[bytes, bytes]:
     Scanner Service, etc.) recognize the device as a generic scanner.
     """
     admin_uri = f"http://{address}:{config.port}".encode()
-
-    color_support = ",".join(
-        "color" if m == "RGB24" else "grayscale"
-        for m in config.color_modes
+    representation = (
+        f"http://{address}:{config.port}/eSCL/ScannerIcon".encode()
     )
 
+    # ``cs`` (color support) accepts an eSCL-specific vocabulary that real
+    # scanners use. Translate our config color modes into that vocabulary.
+    cs_tokens: list[str] = []
+    for mode in config.color_modes:
+        if mode == "RGB24":
+            cs_tokens.append("color")
+        elif mode == "Grayscale8":
+            cs_tokens.append("grayscale")
+        elif mode == "BlackAndWhite1":
+            cs_tokens.append("binary")
+    cs = ",".join(cs_tokens) if cs_tokens else "color,grayscale"
+
     return {
+        # DNS-SD standard
         b"txtvers": b"1",
-        b"adminurl": admin_uri,
-        b"representation": b"image/jpeg,image/png,image/tiff,application/pdf",
-        b"protocol": b"uscan",
+        # Protocol identity
+        b"vers": b"2.0",
         b"rs": b"eSCL",
-        b"cs": color_support.encode(),
-        b"pdl": b"application/pdf,image/jpeg,image/png,image/tiff",
-        b"is": b"platen" + (b",adf" if config.adf_enabled else b""),
-        b"uuid": config.uuid.encode(),
-        b"ty": config.model.encode(),
-        b"note": config.name.encode(),
+        b"protocol": b"uscan",
+        b"ty": f"{config.manufacturer} {config.model}".encode(),
         b"mfg": config.manufacturer.encode(),
         b"mdl": config.model.encode(),
-        b"duplex": b"F",
+        # Document formats (Apple requires application/octet-stream)
+        b"pdl": (
+            b"application/octet-stream,"
+            b"application/pdf,"
+            b"image/jpeg,"
+            b"image/png,"
+            b"image/tiff"
+        ),
+        # Capabilities
+        b"cs": cs.encode(),
+        b"is": b"platen" + (b",adf" if config.adf_enabled else b""),
+        b"duplex": b"T" if config.duplex_supported else b"F",
+        b"priority": b"10",
         b"Scan": b"1",
+        # Identifiers
+        b"uuid": config.uuid.encode(),
+        # Admin / icon URLs
+        b"adminurl": admin_uri,
+        b"representation": representation,
+        b"note": config.name.encode(),
     }
 
 

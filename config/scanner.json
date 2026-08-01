@@ -15,7 +15,7 @@
   "max_height_mm": 297,
 
   "default_format": "image/png",
-  "delay_seconds": 2.0,
+  "delay_seconds": 0.0,
 
   "service_type": "_uscan._tcp.local.",
 

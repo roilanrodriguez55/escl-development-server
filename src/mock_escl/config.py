@@ -34,7 +34,7 @@ class ScannerConfig(BaseModel):
     max_height_mm: int = 297
 
     default_format: str = "image/png"
-    delay_seconds: float = 2.0
+    delay_seconds: float = 0.0
 
     service_type: str = "_uscan._tcp.local."
 
