@@ -63,6 +63,61 @@ def _server_header(config: ScannerConfig) -> str:
     return f"{config.manufacturer} {config.model}"
 
 
+class ScannerFault(Exception):
+    """Internal exception that carries the eSCL ``ScannerFault`` shape.
+
+    Caught by the global exception handler and rendered as a
+    ``<scan:ScanFault>`` XML body so strict eSCL clients can parse it
+    the same way they parse a successful response.
+    """
+
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        status_code: int,
+        command: str = "",
+        detail: str = "",
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.command = command
+        self.detail = detail
+        super().__init__(message)
+
+
+def scanner_fault_xml(
+    code: int,
+    message: str,
+    command: str = "",
+    detail: str = "",
+) -> bytes:
+    """Build a ``<scan:ScanFault>`` XML response body.
+
+    Conforms to the eSCL spec so clients like sane-airscan and
+    Apple Image Capture can parse the error the same way they parse
+    successful responses.
+    """
+    fault_code = _xml_escape(str(code))
+    fault_string = _xml_escape(message)
+    cmd = _xml_escape(command) if command else ""
+    detail_xml = (
+        f"    <scan:Detail>{_xml_escape(detail)}</scan:Detail>\n" if detail else ""
+    )
+    command_xml = (
+        f"    <scan:Command>{cmd}</scan:Command>\n" if command else ""
+    )
+    return (
+        _xml_header()
+        + f"""<scan:ScanFault xmlns:scan="{ESCL_NAMESPACE}" xmlns:pwg="{PWG_NAMESPACE}">
+  <scan:FaultCode>{fault_code}</scan:FaultCode>
+  <scan:FaultString>{fault_string}</scan:FaultString>
+{command_xml}{detail_xml}</scan:ScanFault>
+""".encode("utf-8")
+    )
+
+
 def _format_headers(headers) -> str:
     """Pretty-print an iterable of (key, value) pairs for debug output."""
     return "\n".join(f"    {k}: {v}" for k, v in headers)
@@ -772,6 +827,35 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         openapi_url=None,
     )
 
+    @app.exception_handler(ScannerFault)
+    async def _scanner_fault_handler(_request: Request, exc: ScannerFault) -> Response:
+        """Render a ``<scan:ScanFault>`` XML body for ScannerFault exceptions.
+
+        Strict eSCL clients (sane-airscan, Apple Image Capture) parse error
+        bodies the same way they parse successful responses. Returning
+        FastAPI's default JSON envelope would surface as "Error during
+        device I/O" or similar on those clients.
+        """
+        LOGGER.warning(
+            "[%s] ScannerFault code=%d status=%d message=%s",
+            request_id(),
+            exc.code,
+            exc.status_code,
+            exc.message,
+        )
+        body = scanner_fault_xml(
+            code=exc.code,
+            message=exc.message,
+            command=exc.command,
+            detail=exc.detail,
+        )
+        return Response(
+            status_code=exc.status_code,
+            content=body,
+            media_type="application/xml",
+            headers={"Server": server_header},
+        )
+
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
         """Per-request diagnostics: id, headers, body, response, duration.
@@ -952,7 +1036,12 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         job = jobs.get(job_id)
         if job is None:
             LOGGER.info("[%s] unknown job %s", request_id(), job_id)
-            raise HTTPException(status_code=404, detail="Unknown scan job")
+            raise ScannerFault(
+                code=404,
+                message=f"Unknown scan job: {job_id}",
+                status_code=404,
+                command=f"/eSCL/ScanJobs/{job_id}",
+            )
         LOGGER.debug(
             "[%s] job %s state=%s reason=%s age=%ds images=%d/%d",
             request_id(),
@@ -974,7 +1063,12 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         job = jobs.get(job_id)
         if job is None:
             LOGGER.info("[%s] ScanImageInfo for unknown job %s", request_id(), job_id)
-            raise HTTPException(status_code=404, detail="Unknown scan job")
+            raise ScannerFault(
+                code=404,
+                message=f"Unknown scan job: {job_id}",
+                status_code=404,
+                command=f"/eSCL/ScanJobs/{job_id}/ScanImageInfo",
+            )
         LOGGER.debug(
             "[%s] ScanImageInfo job=%s state=%s format=%s %dx%d @ %d DPI",
             request_id(),
@@ -1011,7 +1105,12 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         job = jobs.get(job_id)
         if job is None:
             LOGGER.info("[%s] NextDocument for unknown job %s", request_id(), job_id)
-            raise HTTPException(status_code=404, detail="Unknown scan job")
+            raise ScannerFault(
+                code=404,
+                message=f"Unknown scan job: {job_id}",
+                status_code=404,
+                command=f"/eSCL/ScanJobs/{job_id}/NextDocument",
+            )
 
         accept = request.headers.get("Accept", "")
         LOGGER.debug(
@@ -1029,13 +1128,22 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
                 job_id,
                 job.error_message,
             )
-            raise HTTPException(
+            raise ScannerFault(
+                code=500,
+                message=job.error_message or "Scan failed",
                 status_code=500,
-                detail=job.error_message or "Scan failed",
+                command=f"/eSCL/ScanJobs/{job_id}/NextDocument",
+                detail="The scanner could not produce a valid image for this job.",
             )
 
         if job.state == JobState.ABORTED:
-            raise HTTPException(status_code=410, detail="Job aborted")
+            raise ScannerFault(
+                code=410,
+                message="Job aborted",
+                status_code=410,
+                command=f"/eSCL/ScanJobs/{job_id}/NextDocument",
+                detail="The job was cancelled before it produced any documents.",
+            )
 
         if job.state != JobState.COMPLETED:
             # Per eSCL spec, 503 + Retry-After tells the client the job is
@@ -1068,7 +1176,13 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
                 job.pages_delivered,
                 job.pages_total,
             )
-            raise HTTPException(status_code=404, detail="No more documents")
+            raise ScannerFault(
+                code=404,
+                message="No more documents",
+                status_code=404,
+                command=f"/eSCL/ScanJobs/{job_id}/NextDocument",
+                detail="All pages of this job have already been delivered.",
+            )
 
         job.pages_delivered += 1
 
@@ -1125,7 +1239,12 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         job = jobs.get(job_id)
         if job is None:
             LOGGER.info("[%s] DELETE unknown job %s", request_id(), job_id)
-            raise HTTPException(status_code=404, detail="Unknown scan job")
+            raise ScannerFault(
+                code=404,
+                message=f"Unknown scan job: {job_id}",
+                status_code=404,
+                command=f"/eSCL/ScanJobs/{job_id}",
+            )
         LOGGER.info(
             "[%s] DELETE job %s (was %s)",
             request_id(),
