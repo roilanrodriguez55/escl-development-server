@@ -176,9 +176,10 @@ def test_poll_to_completed_and_fetch_png(client) -> None:
                     headers={"Content-Type": "application/xml"})
     job_url = r.headers["location"]
 
-    # Job should reach Completed almost immediately (delay=0).
+    # The page is rendered immediately (delay=0) but the job stays
+    # Processing until it is transferred.
     state = client.get(job_url).text
-    assert "<pwg:JobState>Completed</pwg:JobState>" in state
+    assert "<pwg:JobState>Processing</pwg:JobState>" in state
 
     # ScanImageInfo
     info = client.get(f"{job_url}/ScanImageInfo").text
@@ -192,6 +193,9 @@ def test_poll_to_completed_and_fetch_png(client) -> None:
     assert doc.content[:8] == b"\x89PNG\r\n\x1a\n"
     # PNG layout: 8-byte signature | 4-byte length | 4-byte "IHDR" | payload
     assert doc.content[12:16] == b"IHDR"
+
+    # Transferred → Completed.
+    assert "<pwg:JobState>Completed</pwg:JobState>" in client.get(job_url).text
 
 
 def test_pdf_next_document_is_real_pdf(client) -> None:
@@ -207,7 +211,7 @@ def test_pdf_next_document_is_real_pdf(client) -> None:
     r = client.post("/eSCL/ScanJobs", content=body,
                     headers={"Content-Type": "application/xml"})
     job_url = r.headers["location"]
-    assert "<pwg:JobState>Completed</pwg:JobState>" in client.get(job_url).text
+    assert "<pwg:JobState>Processing</pwg:JobState>" in client.get(job_url).text
 
     doc = client.get(f"{job_url}/NextDocument")
     assert doc.status_code == 200
@@ -247,6 +251,8 @@ def test_delete_completed_job_returns_200(client) -> None:
     r = client.post("/eSCL/ScanJobs", content=body,
                     headers={"Content-Type": "application/xml"})
     job_url = r.headers["location"]
+    # Pull the page so the job actually reaches Completed.
+    assert client.get(f"{job_url}/NextDocument").status_code == 200
     assert "<pwg:JobState>Completed</pwg:JobState>" in client.get(job_url).text
 
     delete = client.delete(job_url)

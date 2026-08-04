@@ -1147,7 +1147,7 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
                 detail="The job was cancelled before it produced any documents.",
             )
 
-        if job.state != JobState.COMPLETED:
+        if not job.pages:
             # Per eSCL spec, 503 + Retry-After tells the client the job is
             # still running. sane-airscan classifies a 503 as "temporary" but
             # only retries when the body parses as a ScannerStatus XML whose
@@ -1189,6 +1189,10 @@ def create_app(config: ScannerConfig, seed: int | None = None) -> FastAPI:
         page_index = job.pages_delivered
         job.pages_delivered += 1
         page_bytes = job.pages[page_index]
+
+        # The job is only Completed once every page has been handed over.
+        if job.pages_delivered >= job.pages_total:
+            job.state = JobState.COMPLETED
 
         ext = {
             "image/jpeg": "jpg",

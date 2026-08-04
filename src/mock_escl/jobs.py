@@ -181,9 +181,15 @@ class JobManager:
                 )
                 job.state = JobState.ABORTED
             else:
-                job.state = JobState.COMPLETED
+                # Stay in Processing: the pages exist but nothing has been
+                # transferred yet. Flipping to Completed here makes macOS
+                # (AirScanScanner) read the job as "finished, produced
+                # nothing" and abort before it ever calls NextDocument.
+                # NextDocument marks the job Completed once the last page
+                # has actually been handed over.
+                job.state = JobState.PROCESSING
                 LOGGER.info(
-                    "[job %s] completed (%d page(s) %s in %.1f ms)",
+                    "[job %s] rendered (%d page(s) %s in %.1f ms), awaiting transfer",
                     job.job_id,
                     len(job.pages),
                     job.document_format,

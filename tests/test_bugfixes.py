@@ -13,7 +13,7 @@ ESCL_NS = "http://schemas.hp.com/imaging/escl/2011/05/03"
 PWG_NS = "http://www.pwg.org/schemas/2010/12/sm"
 
 
-def test_job_is_completed_when_location_returned_with_zero_delay(client) -> None:
+def test_page_is_ready_when_location_returned_with_zero_delay(client) -> None:
     """Regression: race condition where NextDocument saw PENDING and 503'd.
 
     With ``delay_seconds: 0`` (the default), the previous implementation
@@ -21,6 +21,9 @@ def test_job_is_completed_when_location_returned_with_zero_delay(client) -> None
     201 + Location immediately. A fast client that polled NextDocument
     before the event loop had a chance to run the task would see the
     state as PENDING and get 503 forever. We now render inline.
+
+    The job stays ``Processing`` until the page is actually transferred —
+    reporting ``Completed`` with nothing transferred makes macOS abort.
     """
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="{ESCL_NS}" xmlns:pwg="{PWG_NS}">
@@ -35,13 +38,16 @@ def test_job_is_completed_when_location_returned_with_zero_delay(client) -> None
     assert r.status_code == 201
     loc = r.headers["location"]
 
-    # Without any further delay, the job should be Completed.
+    # Without any further delay, the page is rendered and awaiting transfer.
     state = client.get(loc).text
-    assert "<pwg:JobState>Completed</pwg:JobState>" in state
+    assert "<pwg:JobState>Processing</pwg:JobState>" in state
 
     # And the NextDocument should return 200, not 503.
     nd = client.get(f"{loc}/NextDocument")
     assert nd.status_code == 200, nd.text[:200]
+
+    # Only now, with the page handed over, is the job Completed.
+    assert "<pwg:JobState>Completed</pwg:JobState>" in client.get(loc).text
     assert nd.headers["content-type"] == "image/jpeg"
     assert nd.content[:3] == b"\xff\xd8\xff"
 
